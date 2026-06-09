@@ -361,6 +361,293 @@ router.post(
   }
 );
 
+// ============ 财务：结算批次管理 ============
+
+router.post(
+  '/batches',
+  requireRoles(UserRole.ADMIN, UserRole.FINANCE),
+  [
+    body('name').isString().notEmpty().withMessage('请输入批次名称'),
+    body('settlementIds').optional().isArray(),
+    handleValidation,
+  ],
+  async (req: AuthRequest, res, next) => {
+    try {
+      const { name, settlementIds, remark } = req.body;
+      const userId = req.user!.id;
+
+      const batchNo = `BATCH${Date.now()}${Math.floor(Math.random() * 1000).toString().padStart(3, '0')}`;
+
+      const batch = await prisma.settlementBatch.create({
+        data: {
+          batchNo,
+          name,
+          remark: remark || null,
+          creatorId: userId,
+          status: 'OPEN',
+        },
+      });
+
+      const results: Array<{ settlementId: number; success: boolean; message: string }> = [];
+      let totalAmount = 0;
+      let invRecv = 0;
+      let apprCount = 0;
+      let paidCount = 0;
+
+      if (settlementIds && settlementIds.length > 0) {
+        for (const sid of settlementIds) {
+          try {
+            const id = Number(sid);
+            if (!id) { results.push({ settlementId: sid, success: false, message: '结算单ID无效' }); continue; }
+            const s = await prisma.settlement.findUnique({ where: { id } });
+            if (!s) { results.push({ settlementId: sid, success: false, message: '结算单不存在' }); continue; }
+            if (s.batchId) { results.push({ settlementId: sid, success: false, message: '该结算单已绑定其他批次' }); continue; }
+
+            await prisma.settlement.update({ where: { id }, data: { batchId: batch.id } });
+            totalAmount += Number(s.finalAmount);
+            if (s.invoiceReceived) invRecv += 1;
+            if (s.status === 'APPROVED' || s.status === 'PAID') apprCount += 1;
+            if (s.status === 'PAID') paidCount += 1;
+            results.push({ settlementId: sid, success: true, message: '已加入批次' });
+          } catch (e: any) {
+            results.push({ settlementId: sid, success: false, message: `处理异常: ${e.message}` });
+          }
+        }
+
+        const addedCount = results.filter((r) => r.success).length;
+        if (addedCount > 0) {
+          await prisma.settlementBatch.update({
+            where: { id: batch.id },
+            data: {
+              totalAmount,
+              invoiceReceivedCount: invRecv,
+              approvedCount: apprCount,
+              paidCount,
+            },
+          });
+        }
+      }
+
+      success(res, {
+        batch: { id: batch.id, batchNo: batch.batchNo, name: batch.name, status: batch.status },
+        total: results.length,
+        addedCount: results.filter((r) => r.success).length,
+        failedCount: results.filter((r) => !r.success).length,
+        results,
+      }, `批次创建成功，已加入 ${results.filter((r) => r.success).length} 笔结算单`);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.get(
+  '/batches',
+  requireRoles(UserRole.ADMIN, UserRole.FINANCE),
+  [
+    query('status').optional().isString(),
+    query('keyword').optional().isString(),
+    handleValidation,
+  ],
+  async (_req, res, next) => {
+    try {
+      const { page, pageSize, skip } = parsePagination(_req);
+      const { status, keyword } = _req.query;
+
+      const where: any = {};
+      if (status) where.status = status;
+      if (keyword) where.OR = [{ name: { contains: keyword as string } }, { batchNo: { contains: keyword as string } }];
+
+      const [list, total] = await Promise.all([
+        prisma.settlementBatch.findMany({
+          where,
+          skip,
+          take: pageSize,
+          orderBy: { createdAt: 'desc' },
+          include: {
+            creator: { select: { id: true, username: true, realName: true } },
+            _count: { select: { settlements: true } },
+          },
+        }),
+        prisma.settlementBatch.count({ where }),
+      ]);
+
+      const stats = await prisma.settlementBatch.aggregate({
+        _sum: { totalAmount: true },
+        _count: true,
+      });
+
+      const listWithProgress = list.map((b: any) => {
+        const total = b._count.settlements;
+        return {
+          id: b.id,
+          batchNo: b.batchNo,
+          name: b.name,
+          status: b.status,
+          remark: b.remark,
+          totalAmount: Number(b.totalAmount),
+          settlementCount: total,
+          invoiceReceivedCount: b.invoiceReceivedCount,
+          approvedCount: b.approvedCount,
+          paidCount: b.paidCount,
+          progress: {
+            invoiceProgress: total > 0 ? `${Math.round((b.invoiceReceivedCount / total) * 100)}%` : '0%',
+            approveProgress: total > 0 ? `${Math.round((b.approvedCount / total) * 100)}%` : '0%',
+            paidProgress: total > 0 ? `${Math.round((b.paidCount / total) * 100)}%` : '0%',
+            completed: total > 0 && b.paidCount === total,
+          },
+          creator: b.creator,
+          closedAt: b.closedAt,
+          createdAt: b.createdAt,
+        };
+      });
+
+      successWithPagination(res, listWithProgress, total, page, pageSize, {
+        summary: {
+          totalBatchCount: stats._count,
+          totalBatchAmount: Number(stats._sum.totalAmount || 0).toFixed(2),
+        },
+      }, '批次列表加载成功');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.get(
+  '/batches/:bid',
+  requireRoles(UserRole.ADMIN, UserRole.FINANCE),
+  [param('bid').isInt(), handleValidation],
+  async (req, res, next) => {
+    try {
+      const id = Number(req.params.bid);
+      const batch = await prisma.settlementBatch.findUnique({
+        where: { id },
+        include: {
+          creator: { select: { id: true, username: true, realName: true } },
+          settlements: {
+            include: {
+              invitation: { include: { brand: true } },
+              talent: { select: { id: true, nickname: true, realName: true, xhsId: true } },
+              approver: { select: { username: true, realName: true } },
+            },
+            orderBy: { createdAt: 'desc' },
+          },
+        },
+      });
+      if (!batch) throw new ApiError(404, 404, '结算批次不存在');
+
+      const settlements = (batch as any).settlements;
+      const count = settlements.length;
+
+      const operations: Array<{
+        settlementId: number;
+        title: string;
+        talent: string;
+        brand: string;
+        status: string;
+        finalAmount: number;
+        invoice: { received: boolean; invoiceNo: string | null };
+        approval: { approved: boolean; approver: string | null; approvedAt: string | null };
+        payment: { paid: boolean; paidAt: string | null; voucher: string | null };
+        detailType: string;
+      }> = settlements.map((s: any) => ({
+        settlementId: s.id,
+        title: s.invitation?.title || '',
+        talent: s.talent?.nickname || '',
+        brand: s.invitation?.brand?.name || '',
+        status: s.status,
+        finalAmount: Number(s.finalAmount),
+        invoice: {
+          received: s.invoiceReceived,
+          invoiceNo: s.invoiceNo,
+        },
+        approval: {
+          approved: s.status === 'APPROVED' || s.status === 'PAID',
+          approver: s.approver?.realName || s.approver?.username || null,
+          approvedAt: s.status === 'APPROVED' ? s.updatedAt : s.paidAt,
+        },
+        payment: {
+          paid: s.status === 'PAID',
+          paidAt: s.paidAt,
+          voucher: s.paymentVoucher,
+        },
+        detailType: 'SETTLEMENT_DETAIL',
+      }));
+
+      const invoicesAll = operations.filter((o) => o.invoice.received).length;
+      const approvalsAll = operations.filter((o) => o.approval.approved).length;
+      const paymentsAll = operations.filter((o) => o.payment.paid).length;
+
+      success(res, {
+        batch: {
+          id: batch.id,
+          batchNo: batch.batchNo,
+          name: batch.name,
+          status: batch.status,
+          remark: batch.remark,
+          totalAmount: Number(batch.totalAmount),
+          settlementCount: count,
+          creator: batch.creator,
+          closedAt: batch.closedAt,
+          createdAt: batch.createdAt,
+          updatedAt: batch.updatedAt,
+        },
+        progress: {
+          total: count,
+          invoiceReceivedCount: invoicesAll,
+          approvedCount: approvalsAll,
+          paidCount: paymentsAll,
+          invoiceProgress: count > 0 ? `${Math.round((invoicesAll / count) * 100)}%` : '0%',
+          approveProgress: count > 0 ? `${Math.round((approvalsAll / count) * 100)}%` : '0%',
+          paidProgress: count > 0 ? `${Math.round((paymentsAll / count) * 100)}%` : '0%',
+          completed: count > 0 && paymentsAll === count,
+        },
+        items: operations,
+        actionSuggestions: {
+          pendingInvoices: operations.filter((o) => !o.invoice.received).map((o) => o.settlementId),
+          pendingApproval: operations.filter((o) => o.invoice.received && !o.approval.approved).map((o) => o.settlementId),
+          pendingPayment: operations.filter((o) => o.approval.approved && !o.payment.paid).map((o) => o.settlementId),
+        },
+      }, '批次详情加载成功');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.post(
+  '/batches/:bid/close',
+  requireRoles(UserRole.ADMIN, UserRole.FINANCE),
+  [param('bid').isInt(), handleValidation],
+  async (req: AuthRequest, res, next) => {
+    try {
+      const id = Number(req.params.bid);
+      const batch = await prisma.settlementBatch.findUnique({ where: { id }, include: { settlements: true } });
+      if (!batch) throw new ApiError(404, 404, '结算批次不存在');
+
+      const total = (batch as any).settlements.length;
+      const allPaid = total > 0 && (batch as any).settlements.every((s: any) => s.status === 'PAID');
+
+      const updated = await prisma.settlementBatch.update({
+        where: { id },
+        data: {
+          status: allPaid ? 'CLOSED' : 'PARTIAL_CLOSED',
+          closedAt: new Date(),
+          remark: req.body.remark || batch.remark,
+        },
+      });
+
+      success(res, {
+        batch: { id: updated.id, status: updated.status, closedAt: updated.closedAt },
+        message: allPaid ? '批次已全额完成并关闭' : '批次已部分关闭，仍有未付款结算单',
+      }, allPaid ? '批次已成功关闭' : '批次已部分关闭');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 router.get('/:id', [param('id').isInt(), handleValidation], async (req, res, next) => {
   try {
     const settlement = await prisma.settlement.findUnique({

@@ -28,6 +28,7 @@ model User {
   contentReviewed       Content[]      @relation("ContentReviewer")
   revisionProposed      Revision[]     @relation("RevisionProposer")
   settlementApproved    Settlement[]   @relation("SettlementApprover")
+  settlementBatches     SettlementBatch[]
   riskRecordHandled     RiskRecord[]   @relation("RiskRecordHandler")
 }
 
@@ -240,11 +241,31 @@ model Settlement {
   status            String     @default("PENDING")
   approverId        Int?
   approver          User?      @relation("SettlementApprover", fields: [approverId], references: [id])
+  batchId           Int?
+  batch             SettlementBatch? @relation(fields: [batchId], references: [id])
   paidAt            DateTime?
   paymentVoucher    String?
   remark            String?
   createdAt         DateTime   @default(now())
   updatedAt         DateTime   @updatedAt
+}
+
+model SettlementBatch {
+  id                  Int          @id @default(autoincrement())
+  batchNo             String       @unique
+  name                String
+  status              String       @default("OPEN")
+  totalAmount         Decimal      @default(0)
+  invoiceReceivedCount Int         @default(0)
+  approvedCount       Int          @default(0)
+  paidCount           Int          @default(0)
+  creatorId           Int?
+  creator             User?        @relation(fields: [creatorId], references: [id])
+  settlements         Settlement[]
+  closedAt            DateTime?
+  remark              String?
+  createdAt           DateTime     @default(now())
+  updatedAt           DateTime     @updatedAt
 }
 
 model RiskRecord {
