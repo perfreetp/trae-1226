@@ -1,0 +1,324 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            Int        @id @default(autoincrement())
+  username      String     @unique
+  password      String
+  email         String?    @unique
+  phone         String?    @unique
+  role          String
+  realName      String?
+  avatarUrl     String?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  talent        Talent?
+  notifications Notification[]
+
+  blacklistOperated     Blacklist[]    @relation("BlacklistOperator")
+  invitationOperated    Invitation[]   @relation("InvitationOperator")
+  statusLogOperated     StatusLog[]    @relation("StatusLogOperator")
+  contentSubmitted      Content[]      @relation("ContentSubmitter")
+  contentReviewed       Content[]      @relation("ContentReviewer")
+  revisionProposed      Revision[]     @relation("RevisionProposer")
+  settlementApproved    Settlement[]   @relation("SettlementApprover")
+  riskRecordHandled     RiskRecord[]   @relation("RiskRecordHandler")
+}
+
+model Tag {
+  id       Int      @id @default(autoincrement())
+  name     String   @unique
+  category String?
+  createdAt DateTime @default(now())
+  talents  TalentTag[]
+}
+
+model Talent {
+  id             Int           @id @default(autoincrement())
+  userId         Int           @unique
+  user           User          @relation(fields: [userId], references: [id])
+  xhsId          String        @unique
+  nickname       String
+  avatarUrl      String?
+  bio            String?
+  followerCount  Int           @default(0)
+  likeCount      Int           @default(0)
+  collectCount   Int           @default(0)
+  status         String        @default("PENDING")
+  realName       String?
+  idCardNo       String?
+  phone          String?
+  wechat         String?
+  email          String?
+  bankAccount    String?
+  bankName       String?
+  taxRate        Decimal       @default(0)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+  tags           TalentTag[]
+  quotations     Quotation[]
+  invitations    Invitation[]
+  blacklist      Blacklist?
+  contents       Content[]
+  performances   PerformanceData[]
+  settlements    Settlement[]
+  riskRecords    RiskRecord[]
+  cooperations   Cooperation[]
+}
+
+model TalentTag {
+  talentId   Int
+  tagId      Int
+  assignedAt DateTime @default(now())
+
+  talent Talent @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([talentId, tagId])
+}
+
+model Quotation {
+  id          Int      @id @default(autoincrement())
+  talentId    Int
+  talent      Talent   @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  contentType String
+  price       Decimal
+  platformFee Decimal?
+  finalPrice  Decimal?
+  note        String?
+  effectiveAt DateTime?
+  expireAt    DateTime?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Blacklist {
+  id           Int      @id @default(autoincrement())
+  talentId     Int      @unique
+  talent       Talent   @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  reason       String
+  operatorId   Int?
+  operator     User?    @relation("BlacklistOperator", fields: [operatorId], references: [id])
+  permanent    Boolean  @default(false)
+  expireAt     DateTime?
+  createdAt    DateTime @default(now())
+}
+
+model Brand {
+  id           Int      @id @default(autoincrement())
+  name         String   @unique
+  logoUrl      String?
+  industry     String?
+  contactName  String?
+  contactPhone String?
+  contactEmail String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  invitations  Invitation[]
+  cooperations Cooperation[]
+}
+
+model Invitation {
+  id              Int        @id @default(autoincrement())
+  brandId         Int
+  brand           Brand      @relation(fields: [brandId], references: [id], onDelete: Cascade)
+  talentId        Int
+  talent          Talent     @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  title           String
+  description     String
+  requirements    String?
+  contentType     String
+  deadline        DateTime
+  scheduledAt     DateTime?
+  budget          Decimal
+  status          String     @default("DRAFT")
+  operatorId      Int?
+  operator        User?      @relation("InvitationOperator", fields: [operatorId], references: [id])
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  contents        Content[]
+  settlements     Settlement[]
+  statusLogs      StatusLog[]
+  cooperations    Cooperation[]
+}
+
+model StatusLog {
+  id           Int        @id @default(autoincrement())
+  invitationId Int
+  invitation   Invitation @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  fromStatus   String
+  toStatus     String
+  operatorId   Int?
+  operator     User?      @relation("StatusLogOperator", fields: [operatorId], references: [id])
+  remark       String?
+  createdAt    DateTime   @default(now())
+}
+
+model Content {
+  id              Int        @id @default(autoincrement())
+  invitationId    Int
+  invitation      Invitation @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  talentId        Int
+  talent          Talent     @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  noteUrl         String?
+  title           String?
+  coverImageUrl   String?
+  contentImages   String?
+  body            String?
+  reviewStatus    String     @default("PENDING")
+  submitterId     Int?
+  submitter       User?      @relation("ContentSubmitter", fields: [submitterId], references: [id])
+  reviewerId      Int?
+  reviewer        User?      @relation("ContentReviewer", fields: [reviewerId], references: [id])
+  reviewedAt      DateTime?
+  reviewRemark    String?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  revisions       Revision[]
+  performances    PerformanceData[]
+}
+
+model Revision {
+  id            Int      @id @default(autoincrement())
+  contentId     Int
+  content       Content  @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  version       Int      @default(1)
+  title         String?
+  coverImageUrl String?
+  contentImages String?
+  body          String?
+  changeLog     String?
+  proposerId    Int?
+  proposer      User?    @relation("RevisionProposer", fields: [proposerId], references: [id])
+  createdAt     DateTime @default(now())
+}
+
+model PerformanceData {
+  id             Int      @id @default(autoincrement())
+  contentId      Int?
+  content        Content? @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  talentId       Int
+  talent         Talent   @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  date           DateTime
+  readCount      Int      @default(0)
+  likeCount      Int      @default(0)
+  commentCount   Int      @default(0)
+  collectCount   Int      @default(0)
+  shareCount     Int      @default(0)
+  followCount    Int      @default(0)
+  clueCount      Int      @default(0)
+  commentRate    Decimal  @default(0)
+  interactionRate Decimal @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([contentId, date])
+}
+
+model Settlement {
+  id                Int        @id @default(autoincrement())
+  invitationId      Int
+  invitation        Invitation @relation(fields: [invitationId], references: [id], onDelete: Cascade)
+  talentId          Int
+  talent            Talent     @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  baseAmount        Decimal
+  commissionRate    Decimal
+  commission        Decimal
+  taxAmount         Decimal
+  finalAmount       Decimal
+  invoiceNo         String?
+  invoiceUrl        String?
+  invoiceReceived   Boolean    @default(false)
+  invoiceReceivedAt DateTime?
+  status            String     @default("PENDING")
+  approverId        Int?
+  approver          User?      @relation("SettlementApprover", fields: [approverId], references: [id])
+  paidAt            DateTime?
+  paymentVoucher    String?
+  remark            String?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+}
+
+model RiskRecord {
+  id           Int      @id @default(autoincrement())
+  talentId     Int
+  talent       Talent   @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  contentId    Int?
+  invitationId Int?
+  type         String
+  level        String
+  title        String
+  description  String
+  evidence     String?
+  handled      Boolean  @default(false)
+  handlerId    Int?
+  handler      User?    @relation("RiskRecordHandler", fields: [handlerId], references: [id])
+  handleRemark String?
+  handledAt    DateTime?
+  createdAt    DateTime @default(now())
+}
+
+model ProhibitedWord {
+  id        Int      @id @default(autoincrement())
+  word      String   @unique
+  category  String?
+  severity  String   @default("MEDIUM")
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Cooperation {
+  id           Int        @id @default(autoincrement())
+  talentId     Int
+  talent       Talent     @relation(fields: [talentId], references: [id], onDelete: Cascade)
+  brandId      Int
+  brand        Brand      @relation(fields: [brandId], references: [id])
+  invitationId Int
+  invitation   Invitation @relation(fields: [invitationId], references: [id])
+  startDate    DateTime
+  endDate      DateTime?
+  createdAt    DateTime   @default(now())
+
+  @@unique([talentId, brandId, invitationId])
+}
+
+model Notification {
+  id            Int      @id @default(autoincrement())
+  userId        Int
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type          String
+  channel       String
+  title         String
+  content       String
+  relatedType   String?
+  relatedId     Int?
+  isRead        Boolean  @default(false)
+  readAt        DateTime?
+  sentAt        DateTime?
+  sendStatus    String   @default("PENDING")
+  failReason    String?
+  createdAt     DateTime @default(now())
+  readReceiptId Int?     @unique
+}
+
+model NotificationTemplate {
+  id        Int      @id @default(autoincrement())
+  code      String   @unique
+  name      String
+  type      String
+  channel   String
+  title     String
+  content   String
+  enabled   Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
