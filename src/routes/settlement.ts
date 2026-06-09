@@ -65,6 +65,302 @@ router.get(
   }
 );
 
+// ============ 财务：批量结算流程 ============
+
+router.get(
+  '/batch/pending-list',
+  requireRoles(UserRole.ADMIN, UserRole.FINANCE),
+  [
+    query('brandId').optional().isInt(),
+    query('talentId').optional().isInt(),
+    query('startDate').optional().isString(),
+    query('endDate').optional().isString(),
+    query('includeWithExisting').optional().isBoolean(),
+    handleValidation,
+  ],
+  async (_req, res, next) => {
+    try {
+      const { brandId, talentId, startDate, endDate, includeWithExisting } = _req.query;
+      const includeExisting = includeWithExisting === 'true';
+
+      const invWhere: any = { status: InvitationStatus.COMPLETED };
+      if (brandId) invWhere.brandId = Number(brandId);
+      if (talentId) invWhere.talentId = Number(talentId);
+      if (startDate) invWhere.updatedAt = { ...invWhere.updatedAt, gte: new Date(startDate as string) };
+      if (endDate) {
+        const eDate = new Date(endDate as string);
+        eDate.setHours(23, 59, 59, 999);
+        invWhere.updatedAt = { ...invWhere.updatedAt, lte: eDate };
+      }
+
+      const completedInvitations = await prisma.invitation.findMany({
+        where: invWhere,
+        orderBy: { updatedAt: 'desc' },
+        include: {
+          brand: { select: { id: true, name: true } },
+          talent: { select: { id: true, nickname: true, realName: true, taxRate: true } },
+          settlements: true,
+          contents: { select: { id: true, reviewStatus: true, createdAt: true } },
+        },
+      });
+
+      const pendingList = completedInvitations
+        .filter((inv: any) => includeExisting || inv.settlements.length === 0)
+        .map((inv: any) => {
+          const baseAmount = Number(inv.budget);
+          const rate = Number(inv.talent.taxRate || 10);
+          const commission = baseAmount * (rate / 100);
+          const taxAmount = baseAmount * 0.06;
+          const finalAmount = baseAmount - commission - taxAmount;
+          const existingSettlement = inv.settlements[0] || null;
+
+          return {
+            invitationId: inv.id,
+            invitationTitle: inv.title,
+            brand: inv.brand,
+            talent: inv.talent,
+            budget: baseAmount.toFixed(2),
+            contentType: inv.contentType,
+            completedAt: inv.updatedAt,
+            contentsPassed: inv.contents.filter((c: any) => c.reviewStatus === 'APPROVED').length,
+            contentsTotal: inv.contents.length,
+            calculation: {
+              commissionRate: `${rate.toFixed(2)}%`,
+              commission: commission.toFixed(2),
+              taxAmount: taxAmount.toFixed(2),
+              finalAmount: finalAmount.toFixed(2),
+            },
+            existingSettlement: existingSettlement
+              ? {
+                  id: existingSettlement.id,
+                  status: existingSettlement.status,
+                  finalAmount: Number(existingSettlement.finalAmount),
+                }
+              : null,
+          };
+        });
+
+      const summary = pendingList.reduce(
+        (acc, item) => {
+          acc.count += 1;
+          acc.totalBudget += Number(item.budget);
+          acc.totalFinal += Number(item.calculation.finalAmount);
+          if (item.existingSettlement) acc.withExisting += 1;
+          else acc.needCreate += 1;
+          return acc;
+        },
+        { count: 0, totalBudget: 0, totalFinal: 0, needCreate: 0, withExisting: 0 }
+      );
+
+      success(res, {
+        summary: {
+          totalCount: summary.count,
+          needCreateCount: summary.needCreate,
+          withExistingCount: summary.withExisting,
+          totalBudget: summary.totalBudget.toFixed(2),
+          totalEstimatedPayout: summary.totalFinal.toFixed(2),
+        },
+        list: pendingList,
+      }, '待结算清单生成完成');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.post(
+  '/batch/invoice',
+  requireRoles(UserRole.ADMIN, UserRole.FINANCE),
+  [
+    body('items').isArray({ min: 1 }).withMessage('请至少选择一条结算单'),
+    handleValidation,
+  ],
+  async (req: AuthRequest, res, next) => {
+    try {
+      const { items } = req.body;
+      const results: Array<{
+        settlementId: number;
+        success: boolean;
+        message: string;
+      }> = [];
+
+      for (const item of items) {
+        const { settlementId, invoiceNo, invoiceUrl } = item;
+        try {
+          if (!settlementId || !invoiceNo) {
+            results.push({ settlementId, success: false, message: '缺少结算单ID或发票号' });
+            continue;
+          }
+
+          const settlement = await prisma.settlement.findUnique({ where: { id: Number(settlementId) } });
+          if (!settlement) {
+            results.push({ settlementId, success: false, message: '结算单不存在' });
+            continue;
+          }
+          if (settlement.status !== SettlementStatus.PENDING) {
+            results.push({ settlementId, success: false, message: `当前状态[${settlement.status}]不可登记发票` });
+            continue;
+          }
+
+          await prisma.settlement.update({
+            where: { id: Number(settlementId) },
+            data: {
+              invoiceNo,
+              invoiceUrl: invoiceUrl || null,
+              invoiceReceived: true,
+              invoiceReceivedAt: new Date(),
+              status: SettlementStatus.INVOICE_RECEIVED,
+            },
+          });
+          results.push({ settlementId, success: true, message: '发票登记成功' });
+        } catch (e: any) {
+          results.push({ settlementId, success: false, message: `处理异常: ${e.message}` });
+        }
+      }
+
+      const successCount = results.filter((r) => r.success).length;
+      success(res, {
+        total: results.length,
+        successCount,
+        failCount: results.length - successCount,
+        results,
+      }, `批量登记发票完成：成功${successCount}条，失败${results.length - successCount}条`);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.post(
+  '/batch/approve',
+  requireRoles(UserRole.ADMIN, UserRole.FINANCE),
+  [
+    body('settlementIds').isArray({ min: 1 }).withMessage('请至少选择一条结算单'),
+    handleValidation,
+  ],
+  async (req: AuthRequest, res, next) => {
+    try {
+      const { settlementIds, remark } = req.body;
+      const results: Array<{
+        settlementId: number;
+        success: boolean;
+        message: string;
+      }> = [];
+
+      for (const sid of settlementIds) {
+        try {
+          const id = Number(sid);
+          if (!id) {
+            results.push({ settlementId: sid, success: false, message: '结算单ID无效' });
+            continue;
+          }
+
+          const settlement = await prisma.settlement.findUnique({ where: { id } });
+          if (!settlement) {
+            results.push({ settlementId: sid, success: false, message: '结算单不存在' });
+            continue;
+          }
+
+          const allowed = [SettlementStatus.PENDING, SettlementStatus.INVOICE_RECEIVED];
+          if (!allowed.includes(settlement.status)) {
+            results.push({ settlementId: sid, success: false, message: `当前状态[${settlement.status}]不可审批` });
+            continue;
+          }
+          if (!settlement.invoiceReceived) {
+            results.push({ settlementId: sid, success: false, message: '请先登记发票信息' });
+            continue;
+          }
+
+          await prisma.settlement.update({
+            where: { id },
+            data: {
+              status: SettlementStatus.APPROVED,
+              approverId: req.user!.id,
+              remark: remark || settlement.remark,
+            },
+          });
+          results.push({ settlementId: sid, success: true, message: '审批通过' });
+        } catch (e: any) {
+          results.push({ settlementId: sid, success: false, message: `处理异常: ${e.message}` });
+        }
+      }
+
+      const successCount = results.filter((r) => r.success).length;
+      success(res, {
+        total: results.length,
+        successCount,
+        failCount: results.length - successCount,
+        results,
+      }, `批量审批完成：成功${successCount}条，失败${results.length - successCount}条`);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.post(
+  '/batch/pay',
+  requireRoles(UserRole.ADMIN, UserRole.FINANCE),
+  [
+    body('items').isArray({ min: 1 }).withMessage('请至少选择一条结算单'),
+    handleValidation,
+  ],
+  async (req: AuthRequest, res, next) => {
+    try {
+      const { items } = req.body;
+      const results: Array<{
+        settlementId: number;
+        success: boolean;
+        message: string;
+      }> = [];
+
+      for (const item of items) {
+        const { settlementId, paymentVoucher, remark } = item;
+        try {
+          const id = Number(settlementId);
+          if (!id || !paymentVoucher) {
+            results.push({ settlementId, success: false, message: '缺少结算单ID或付款凭证' });
+            continue;
+          }
+
+          const settlement = await prisma.settlement.findUnique({ where: { id } });
+          if (!settlement) {
+            results.push({ settlementId, success: false, message: '结算单不存在' });
+            continue;
+          }
+          if (settlement.status !== SettlementStatus.APPROVED) {
+            results.push({ settlementId, success: false, message: `当前状态[${settlement.status}]不可标记付款` });
+            continue;
+          }
+
+          await prisma.settlement.update({
+            where: { id },
+            data: {
+              status: SettlementStatus.PAID,
+              paidAt: new Date(),
+              paymentVoucher,
+              remark: remark || settlement.remark,
+            },
+          });
+          results.push({ settlementId, success: true, message: '付款已确认' });
+        } catch (e: any) {
+          results.push({ settlementId, success: false, message: `处理异常: ${e.message}` });
+        }
+      }
+
+      const successCount = results.filter((r) => r.success).length;
+      success(res, {
+        total: results.length,
+        successCount,
+        failCount: results.length - successCount,
+        results,
+      }, `批量标记付款完成：成功${successCount}条，失败${results.length - successCount}条`);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 router.get('/:id', [param('id').isInt(), handleValidation], async (req, res, next) => {
   try {
     const settlement = await prisma.settlement.findUnique({

@@ -98,6 +98,291 @@ router.get(
   }
 );
 
+// ============ 品牌方：合作项目总览（含统计卡片+列表） ============
+
+router.get(
+  '/overview',
+  requireRoles(UserRole.ADMIN, UserRole.OPERATOR),
+  [
+    query('brandId').optional().isInt(),
+    query('talentId').optional().isInt(),
+    query('status').optional().isIn(Object.values(InvitationStatus)),
+    query('startDate').optional().isString(),
+    query('endDate').optional().isString(),
+    handleValidation,
+  ],
+  async (req: AuthRequest, res, next) => {
+    try {
+      const { page, pageSize, skip } = parsePagination(req);
+      const { brandId, talentId, status, startDate, endDate } = req.query;
+
+      const where: any = {};
+      if (brandId) where.brandId = Number(brandId);
+      if (talentId) where.talentId = Number(talentId);
+      if (status) where.status = status as InvitationStatus;
+      if (startDate) where.createdAt = { ...where.createdAt, gte: new Date(startDate as string) };
+      if (endDate) {
+        const eDate = new Date(endDate as string);
+        eDate.setHours(23, 59, 59, 999);
+        where.createdAt = { ...where.createdAt, lte: eDate };
+      }
+
+      const invitations = await prisma.invitation.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        include: {
+          brand: { select: { id: true, name: true, logoUrl: true } },
+          talent: { select: { id: true, nickname: true, avatarUrl: true, xhsId: true } },
+          contents: { select: { id: true, reviewStatus: true, title: true } },
+          settlements: { select: { id: true, status: true, finalAmount: true, paidAt: true } },
+        },
+      });
+
+      const listWithMetrics = invitations.map((inv: any) => {
+        const totalContents = inv.contents.length;
+        const approvedContents = inv.contents.filter((c: any) => c.reviewStatus === 'APPROVED').length;
+        const pendingContents = inv.contents.filter((c: any) => c.reviewStatus === 'PENDING').length;
+        const revisionContents = inv.contents.filter((c: any) => c.reviewStatus === 'NEEDS_REVISION').length;
+        const reviewProgress = totalContents > 0 ? Math.round((approvedContents / totalContents) * 100) : 0;
+
+        const latestSettlement = inv.settlements[0] || null;
+        let settlementProgress = 0;
+        let settlementStatusText = '未开始';
+        if (latestSettlement) {
+          const statusFlow: Record<string, number> = {
+            PENDING: 25,
+            INVOICE_RECEIVED: 50,
+            APPROVED: 75,
+            PAID: 100,
+            DISPUTED: 30,
+          };
+          settlementProgress = statusFlow[latestSettlement.status] || 0;
+          const statusTextMap: Record<string, string> = {
+            PENDING: '待登记发票',
+            INVOICE_RECEIVED: '发票已收到',
+            APPROVED: '审批通过待付款',
+            PAID: '已付款',
+            DISPUTED: '有异议',
+          };
+          settlementStatusText = statusTextMap[latestSettlement.status] || latestSettlement.status;
+        }
+
+        return {
+          id: inv.id,
+          title: inv.title,
+          status: inv.status,
+          contentType: inv.contentType,
+          budget: Number(inv.budget),
+          deadline: inv.deadline,
+          scheduledAt: inv.scheduledAt,
+          createdAt: inv.createdAt,
+          brand: inv.brand,
+          talent: inv.talent,
+          contentProgress: {
+            total: totalContents,
+            approved: approvedContents,
+            pending: pendingContents,
+            needsRevision: revisionContents,
+            progressPercent: reviewProgress,
+          },
+          settlement: latestSettlement
+            ? {
+                id: latestSettlement.id,
+                status: latestSettlement.status,
+                statusText: settlementStatusText,
+                finalAmount: Number(latestSettlement.finalAmount),
+                progressPercent: settlementProgress,
+                paidAt: latestSettlement.paidAt,
+              }
+            : null,
+        };
+      });
+
+      const statCards = invitations.reduce(
+        (acc, inv: any) => {
+          acc.totalCount += 1;
+          acc.totalBudget += Number(inv.budget);
+
+          const statusBucket = acc.byStatus[inv.status] || { count: 0, budget: 0 };
+          statusBucket.count += 1;
+          statusBucket.budget += Number(inv.budget);
+          acc.byStatus[inv.status] = statusBucket;
+
+          const contents = inv.contents || [];
+          acc.totalContents += contents.length;
+          acc.approvedContents += contents.filter((c: any) => c.reviewStatus === 'APPROVED').length;
+
+          const settlements = inv.settlements || [];
+          acc.totalSettlements += settlements.length;
+          settlements.forEach((s: any) => {
+            acc.totalSettlementAmount += Number(s.finalAmount);
+            if (s.status === 'PAID') acc.paidSettlements += 1;
+            else acc.pendingSettlements += 1;
+          });
+
+          return acc;
+        },
+        {
+          totalCount: 0,
+          totalBudget: 0,
+          totalContents: 0,
+          approvedContents: 0,
+          totalSettlements: 0,
+          paidSettlements: 0,
+          pendingSettlements: 0,
+          totalSettlementAmount: 0,
+          byStatus: {} as Record<string, { count: number; budget: number }>,
+        }
+      );
+
+      const paginatedList = listWithMetrics.slice(skip, skip + pageSize);
+      const total = listWithMetrics.length;
+
+      success(res, {
+        stats: {
+          totalProjectCount: statCards.totalCount,
+          totalBudget: statCards.totalBudget.toFixed(2),
+          avgBudgetPerProject: statCards.totalCount > 0 ? (statCards.totalBudget / statCards.totalCount).toFixed(2) : '0.00',
+          contentReviewProgress: statCards.totalContents > 0
+            ? `${Math.round((statCards.approvedContents / statCards.totalContents) * 100)}%`
+            : '0%',
+          settlementProgress: statCards.totalSettlements > 0
+            ? `${Math.round((statCards.paidSettlements / statCards.totalSettlements) * 100)}%`
+            : '0%',
+          pendingSettlementAmount: (statCards.totalSettlementAmount - (statCards.paidSettlements > 0 ? statCards.totalSettlementAmount * (statCards.paidSettlements / statCards.totalSettlements) : 0)).toFixed(2),
+          byStatus: statCards.byStatus,
+        },
+        list: paginatedList,
+        pagination: { page, pageSize, total, totalPages: Math.ceil(total / pageSize) },
+      }, '项目总览数据加载成功');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ============ 达人：我的合作工作台 ============
+
+router.get(
+  '/talent/workbench',
+  requireRoles(UserRole.TALENT),
+  handleValidation,
+  async (req: AuthRequest, res, next) => {
+    try {
+      const talent = await prisma.talent.findUnique({ where: { userId: req.user!.id } });
+      if (!talent) throw new ApiError(404, 404, '达人档案不存在');
+      const talentId = talent.id;
+
+      const [pendingConfirm, inProgressInvitations, settlements, allMyContents] = await Promise.all([
+        prisma.invitation.findMany({
+          where: { talentId, status: InvitationStatus.PENDING_TALENT_CONFIRM },
+          include: { brand: { select: { id: true, name: true, logoUrl: true } } },
+          orderBy: { createdAt: 'desc' },
+        }),
+        prisma.invitation.findMany({
+          where: {
+            talentId,
+            status: { in: [InvitationStatus.IN_PROGRESS, InvitationStatus.TALENT_ACCEPTED, InvitationStatus.CONTENT_SUBMITTED] },
+          },
+          include: { brand: { select: { id: true, name: true, logoUrl: true } } },
+          orderBy: { createdAt: 'desc' },
+        }),
+        prisma.settlement.findMany({
+          where: { talentId },
+          include: { invitation: { include: { brand: true } } },
+          orderBy: { createdAt: 'desc' },
+        }),
+        prisma.content.findMany({
+          where: { invitation: { talentId } },
+          include: { invitation: { select: { id: true, title: true, brandId: true, brand: { select: { id: true, name: true } } } } },
+          orderBy: { updatedAt: 'desc' },
+        }),
+      ]);
+
+      const inProgressInvIds = inProgressInvitations.map((i) => i.id);
+
+      const pendingSubmitContents = allMyContents.filter(
+        (c: any) => c.reviewStatus === 'DRAFT' && inProgressInvIds.includes(c.invitationId)
+      );
+      const needsRevisionContents = allMyContents.filter(
+        (c: any) => c.reviewStatus === 'NEEDS_REVISION'
+      );
+      const pendingReviewContents = allMyContents.filter(
+        (c: any) => c.reviewStatus === 'PENDING'
+      );
+
+      const pendingSettlements = settlements.filter(
+        (s: any) => s.status !== 'PAID'
+      );
+      const completedSettlements = settlements.filter(
+        (s: any) => s.status === 'PAID'
+      );
+
+      success(res, {
+        talent: { id: talent.id, nickname: talent.nickname, avatarUrl: talent.avatarUrl },
+        summary: {
+          pendingConfirmCount: pendingConfirm.length,
+          pendingSubmitCount: pendingSubmitContents.length,
+          needsRevisionCount: needsRevisionContents.length,
+          pendingSettlementCount: pendingSettlements.length,
+          totalEarned: completedSettlements.reduce((acc: number, s: any) => acc + Number(s.finalAmount), 0).toFixed(2),
+        },
+        categories: {
+          pendingConfirm: pendingConfirm.map((inv: any) => ({
+            id: inv.id,
+            title: inv.title,
+            brand: inv.brand,
+            budget: Number(inv.budget),
+            deadline: inv.deadline,
+            createdAt: inv.createdAt,
+            detailType: 'INVITATION',
+          })),
+          pendingSubmit: pendingSubmitContents.map((c: any) => ({
+            id: c.id,
+            invitationId: c.invitationId,
+            title: c.title,
+            brand: c.invitation.brand,
+            contentType: c.contentType,
+            updatedAt: c.updatedAt,
+            detailType: 'CONTENT',
+          })),
+          needsRevision: needsRevisionContents.map((c: any) => ({
+            id: c.id,
+            invitationId: c.invitationId,
+            title: c.title,
+            brand: c.invitation.brand,
+            contentType: c.contentType,
+            updatedAt: c.updatedAt,
+            detailType: 'CONTENT',
+          })),
+          pendingSettlement: pendingSettlements.map((s: any) => ({
+            id: s.id,
+            invitationId: s.invitationId,
+            invitationTitle: s.invitation.title,
+            brand: s.invitation.brand,
+            finalAmount: Number(s.finalAmount),
+            status: s.status,
+            createdAt: s.createdAt,
+            detailType: 'SETTLEMENT',
+          })),
+        },
+        extras: {
+          pendingReview: pendingReviewContents.map((c: any) => ({
+            id: c.id,
+            invitationId: c.invitationId,
+            title: c.title,
+            brand: c.invitation.brand,
+            contentType: c.contentType,
+            submittedAt: c.submittedAt,
+          })),
+        },
+      }, '工作台数据加载成功');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 router.get('/:id', [param('id').isInt(), handleValidation], async (req, res, next) => {
   try {
     const invitation = await prisma.invitation.findUnique({

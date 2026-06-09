@@ -9,6 +9,10 @@ import { RiskLevel, RiskType, UserRole } from '../constants/enums';
 const router = Router();
 router.use(authMiddleware);
 
+function escapeRegExp(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 // ============ 违规词库管理 ============
 
 router.get(
@@ -115,7 +119,8 @@ router.post(
 
       const matches: any[] = [];
       words.forEach((pw) => {
-        const regex = new RegExp(pw.word, 'gi');
+        const safeWord = escapeRegExp(pw.word);
+        const regex = new RegExp(safeWord, 'gi');
         const found = text.match(regex);
         if (found) {
           matches.push({

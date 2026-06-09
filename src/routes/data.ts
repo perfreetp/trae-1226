@@ -287,14 +287,16 @@ router.get(
         eDate.setHours(23, 59, 59, 999);
         perfWhere.date = { ...perfWhere.date, lte: eDate };
       }
-      if (minClueCount) perfWhere.clueCount = { gte: Number(minClueCount) };
+      const clueThreshold = minClueCount ? Number(minClueCount) : 1;
+      perfWhere.clueCount = { gte: clueThreshold };
+
+      const finalWhere = {
+        ...perfWhere,
+        content: contentWhere,
+      };
 
       const clues = await prisma.performanceData.findMany({
-        where: {
-          ...perfWhere,
-          clueCount: { gt: 0 },
-          content: contentWhere,
-        },
+        where: finalWhere,
         skip,
         take: pageSize,
         orderBy: { clueCount: 'desc' },
@@ -309,11 +311,7 @@ router.get(
       });
 
       const total = await prisma.performanceData.count({
-        where: {
-          ...perfWhere,
-          clueCount: { gt: 0 },
-          content: contentWhere,
-        },
+        where: finalWhere,
       });
 
       successWithPagination(res, clues, total, page, pageSize);

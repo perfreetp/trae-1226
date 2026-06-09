@@ -10,7 +10,7 @@ import { TalentStatus, UserRole } from '../constants/enums';
 const router = Router();
 router.use(authMiddleware);
 
-// ============ 达人建档 ============
+// ============ 静态路由：必须放在 /:id 动态路由之前 ============
 
 router.get(
   '/',
@@ -58,23 +58,98 @@ router.get(
   }
 );
 
-router.get('/:id', [param('id').isInt(), handleValidation], async (req, res, next) => {
+// ============ 标签管理 ============
+
+router.get('/tags/list', async (_req, res, next) => {
   try {
-    const talent = await prisma.talent.findUnique({
-      where: { id: Number(req.params.id) },
-      include: {
-        tags: { include: { tag: true } },
-        quotations: true,
-        blacklist: true,
-        user: { select: { username: true, email: true, phone: true } },
-      },
-    });
-    if (!talent) throw new ApiError(404, 404, '达人不存在');
-    success(res, talent);
+    const tags = await prisma.tag.findMany({ orderBy: { name: 'asc' } });
+    success(res, tags);
   } catch (err) {
     next(err);
   }
 });
+
+router.post(
+  '/tags',
+  requireRoles(UserRole.ADMIN, UserRole.OPERATOR),
+  [body('name').notEmpty(), handleValidation],
+  async (req, res, next) => {
+    try {
+      const { name, category } = req.body;
+      const exist = await prisma.tag.findUnique({ where: { name } });
+      if (exist) throw new ApiError(400, 2010, '标签已存在');
+
+      const tag = await prisma.tag.create({ data: { name, category } });
+      success(res, tag, '标签创建成功');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ============ 黑名单 ============
+
+router.get(
+  '/blacklist/list',
+  requireRoles(UserRole.ADMIN, UserRole.OPERATOR),
+  async (req: AuthRequest, res, next) => {
+    try {
+      const { page, pageSize, skip } = parsePagination(req);
+      const [list, total] = await Promise.all([
+        prisma.blacklist.findMany({
+          skip,
+          take: pageSize,
+          orderBy: { createdAt: 'desc' },
+          include: { talent: true },
+        }),
+        prisma.blacklist.count(),
+      ]);
+      successWithPagination(res, list, total, page, pageSize);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ============ 报价（独立资源，不依赖达人id） ============
+
+router.put(
+  '/quotations/:qid',
+  requireRoles(UserRole.ADMIN, UserRole.OPERATOR, UserRole.TALENT),
+  [param('qid').isInt(), handleValidation],
+  async (req: AuthRequest, res, next) => {
+    try {
+      const qid = Number(req.params.qid);
+      const quotation = await prisma.quotation.findUnique({
+        where: { id: qid },
+        include: { talent: true },
+      });
+      if (!quotation) throw new ApiError(404, 404, '报价不存在');
+
+      if (req.user!.role === UserRole.TALENT && quotation.talent.userId !== req.user!.id) {
+        throw new ApiError(403, 403, '无权限操作');
+      }
+
+      const { price, platformFee, isActive, ...rest } = req.body;
+      const finalPrice =
+        price && platformFee
+          ? (Number(price) + Number(platformFee)).toString()
+          : price
+          ? price
+          : undefined;
+
+      const updated = await prisma.quotation.update({
+        where: { id: qid },
+        data: { price, platformFee, finalPrice, isActive, ...rest },
+      });
+      success(res, updated, '报价更新成功');
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ============ 新建达人 ============
 
 router.post(
   '/',
@@ -127,6 +202,26 @@ router.post(
   }
 );
 
+// ============ 动态路由 /:id （及其子路由） ============
+
+router.get('/:id', [param('id').isInt(), handleValidation], async (req, res, next) => {
+  try {
+    const talent = await prisma.talent.findUnique({
+      where: { id: Number(req.params.id) },
+      include: {
+        tags: { include: { tag: true } },
+        quotations: true,
+        blacklist: true,
+        user: { select: { username: true, email: true, phone: true } },
+      },
+    });
+    if (!talent) throw new ApiError(404, 404, '达人不存在');
+    success(res, talent);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.put(
   '/:id',
   requireRoles(UserRole.ADMIN, UserRole.OPERATOR, UserRole.TALENT),
@@ -177,35 +272,6 @@ router.patch(
   }
 );
 
-// ============ 标签管理 ============
-
-router.get('/tags/list', async (_req, res, next) => {
-  try {
-    const tags = await prisma.tag.findMany({ orderBy: { name: 'asc' } });
-    success(res, tags);
-  } catch (err) {
-    next(err);
-  }
-});
-
-router.post(
-  '/tags',
-  requireRoles(UserRole.ADMIN, UserRole.OPERATOR),
-  [body('name').notEmpty(), handleValidation],
-  async (req, res, next) => {
-    try {
-      const { name, category } = req.body;
-      const exist = await prisma.tag.findUnique({ where: { name } });
-      if (exist) throw new ApiError(400, 2010, '标签已存在');
-
-      const tag = await prisma.tag.create({ data: { name, category } });
-      success(res, tag, '标签创建成功');
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
 router.post(
   '/:id/tags',
   requireRoles(UserRole.ADMIN, UserRole.OPERATOR),
@@ -232,8 +298,6 @@ router.post(
     }
   }
 );
-
-// ============ 报价设置 ============
 
 router.get('/:id/quotations', [param('id').isInt(), handleValidation], async (req, res, next) => {
   try {
@@ -282,66 +346,6 @@ router.post(
         },
       });
       success(res, quotation, '报价设置成功');
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
-router.put(
-  '/quotations/:qid',
-  requireRoles(UserRole.ADMIN, UserRole.OPERATOR, UserRole.TALENT),
-  [param('qid').isInt(), handleValidation],
-  async (req: AuthRequest, res, next) => {
-    try {
-      const qid = Number(req.params.qid);
-      const quotation = await prisma.quotation.findUnique({
-        where: { id: qid },
-        include: { talent: true },
-      });
-      if (!quotation) throw new ApiError(404, 404, '报价不存在');
-
-      if (req.user!.role === UserRole.TALENT && quotation.talent.userId !== req.user!.id) {
-        throw new ApiError(403, 403, '无权限操作');
-      }
-
-      const { price, platformFee, isActive, ...rest } = req.body;
-      const finalPrice =
-        price && platformFee
-          ? (Number(price) + Number(platformFee)).toString()
-          : price
-          ? price
-          : undefined;
-
-      const updated = await prisma.quotation.update({
-        where: { id: qid },
-        data: { price, platformFee, finalPrice, isActive, ...rest },
-      });
-      success(res, updated, '报价更新成功');
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
-// ============ 黑名单 ============
-
-router.get(
-  '/blacklist/list',
-  requireRoles(UserRole.ADMIN, UserRole.OPERATOR),
-  async (req: AuthRequest, res, next) => {
-    try {
-      const { page, pageSize, skip } = parsePagination(req);
-      const [list, total] = await Promise.all([
-        prisma.blacklist.findMany({
-          skip,
-          take: pageSize,
-          orderBy: { createdAt: 'desc' },
-          include: { talent: true },
-        }),
-        prisma.blacklist.count(),
-      ]);
-      successWithPagination(res, list, total, page, pageSize);
     } catch (err) {
       next(err);
     }
